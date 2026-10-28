@@ -44,7 +44,9 @@ describe("/herdr and /herdr check", () => {
 		h = await createHarness();
 		for (const args of ["bogus", "check now", "status now"]) {
 			await h.command(args);
-			expect(h.notices).toEqual([{ message: "Usage: /herdr [status|check|auto [<interval>|off]]", level: "warning" }]);
+			expect(h.notices).toEqual([
+				{ message: "Usage: /herdr [status|check|auto [<interval>|off]|focus [<pane>]]", level: "warning" },
+			]);
 		}
 		expect(h.users).toHaveLength(0);
 	});

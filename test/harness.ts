@@ -47,6 +47,8 @@ export interface Harness {
 	users: string[];
 	notices: Notice[];
 	status(): string | undefined;
+	/** The alert widget above the editor, if one is set. */
+	widget(): string[] | undefined;
 	/** Live herdr state. With `event: true` herdr also pushes the status-changed event. */
 	setLive(pane: string, status: PaneStatus, options?: { event?: boolean }): Promise<void>;
 	setIdle(idle: boolean): void;
@@ -65,9 +67,13 @@ export interface Harness {
 	timers(): { count: number; nextInMs: number | undefined };
 	shutdown(): Promise<void>;
 	registered: { commands: Map<string, unknown>; flags: Map<string, unknown> };
+	/** Every request the extension sent to the fake herdr, in order. */
+	requests: Array<{ method: string; params: Record<string, unknown> }>;
 }
 
-export async function createHarness(options: { panes?: string[] } = {}): Promise<Harness> {
+export async function createHarness(
+	options: { panes?: string[]; statuses?: Record<string, PaneStatus> } = {},
+): Promise<Harness> {
 	const socketPath = process.env.HERDR_SOCKET_PATH!;
 	fs.rmSync(socketPath, { force: true });
 	let now = START;
@@ -77,20 +83,23 @@ export async function createHarness(options: { panes?: string[] } = {}): Promise
 	for (const pane of options.panes ?? ["w1:p2", "w1:p3"]) {
 		agents.set(pane, { pane_id: pane, workspace_id: "w1", agent_status: "working", agent: `worker-${pane.split(":")[1]}` });
 	}
+	for (const [pane, status] of Object.entries(options.statuses ?? {})) agents.get(pane)!.agent_status = status;
 
 	// ---- fake herdr
 	const subscribers = new Set<net.Socket>();
 	const heldReplies: Array<() => void> = [];
 	let holding = false;
 	let listCalls = 0;
+	const requests: Array<{ method: string; params: Record<string, unknown> }> = [];
 	const server = net.createServer(socket => {
 		let buf = "";
 		socket.setEncoding("utf8");
 		socket.on("data", (chunk: string) => {
 			buf += chunk;
 			for (let i = buf.indexOf("\n"); i >= 0; i = buf.indexOf("\n")) {
-				const msg = JSON.parse(buf.slice(0, i)) as { id: string; method: string };
+				const msg = JSON.parse(buf.slice(0, i)) as { id: string; method: string; params?: Record<string, unknown> };
 				buf = buf.slice(i + 1);
+				requests.push({ method: msg.method, params: msg.params ?? {} });
 				const reply = (result: unknown) => socket.write(`${JSON.stringify({ id: msg.id, result })}\n`);
 				if (msg.method === "agent.list") {
 					listCalls++;
@@ -103,6 +112,8 @@ export async function createHarness(options: { panes?: string[] } = {}): Promise
 					subscribers.add(socket);
 					socket.on("close", () => subscribers.delete(socket));
 					reply({ type: "subscription_started" });
+				} else if (msg.method === "agent.focus") {
+					reply({ type: "ok" });
 				}
 			}
 		});
@@ -120,6 +131,7 @@ export async function createHarness(options: { panes?: string[] } = {}): Promise
 	const users: string[] = [];
 	const notices: Notice[] = [];
 	let statusText: string | undefined;
+	let widgetLines: string[] | undefined;
 	let idle = true;
 	const timers: Timer[] = [];
 
@@ -149,6 +161,9 @@ export async function createHarness(options: { panes?: string[] } = {}): Promise
 				statusText = text;
 			},
 			notify: (message: string, level?: string) => notices.push({ message, level }),
+			setWidget: (_key: string, content?: string[]) => {
+				widgetLines = content;
+			},
 		},
 		setTimeout(fn: () => void, ms: number): Timer {
 			const timer: Timer = { fn, due: now + ms, cleared: false, fired: false };
@@ -176,6 +191,8 @@ export async function createHarness(options: { panes?: string[] } = {}): Promise
 		users,
 		notices,
 		registered: { commands, flags },
+		requests,
+		widget: () => widgetLines,
 		status: () => statusText,
 		async setLive(pane, status, { event = false } = {}) {
 			agents.get(pane)!.agent_status = status;

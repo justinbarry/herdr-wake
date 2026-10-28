@@ -32,6 +32,7 @@ import wakeTemplate from "./prompts/wake.md" with { type: "text" };
 
 const FLAG = "herdr-wake";
 const STATUS_KEY = "herdr-wake";
+const WIDGET_KEY = "herdr-wake";
 const WAKE_TYPE = "herdr-wake";
 
 const DEBOUNCE_MS = 750; // coalesce flapping panes into one wake
@@ -316,6 +317,7 @@ export default function herdrWake(pi: ExtensionAPI) {
 	const labels = new Map<string, string>();
 	const explicit = new Map<string, ReadonlySet<string>>(); // pane id -> states that wake
 	const muted = new Set<string>();
+	const blockedPanes = new Set<string>(); // watched panes blocked right now, oldest first; drives the alert widget
 
 	const explicitMode = new Map<string, WatchMode>(); // pane id -> "digest" (omitted = "wake")
 	const pending = new Map<string, PendingWake>();
@@ -400,6 +402,34 @@ export default function herdrWake(pi: ExtensionAPI) {
 		}
 	}
 
+	/**
+	 * The blocked-pane alert: a widget above the editor plus a notice when a pane blocks. It comes
+	 * straight from herdr's event, so it never waits on the model, an idle session or a wake slot.
+	 */
+	function showBlocked(): void {
+		try {
+			let lines: string[] | undefined;
+			if (running && blockedPanes.size > 0) {
+				const shown = [...blockedPanes].slice(0, 3).map(p => `${p} (${labels.get(p) ?? "agent"})`);
+				const more = blockedPanes.size > shown.length ? ` +${blockedPanes.size - shown.length} more` : "";
+				lines = [`herdr-wake: ${blockedPanes.size} blocked: ${shown.join(", ")}${more}. /herdr focus jumps to the first.`];
+			}
+			ctxRef?.ui.setWidget(WIDGET_KEY, lines);
+		} catch {
+			// the widget is cosmetic
+		}
+	}
+
+	/**
+	 * Whether other watched panes are working or have updates queued. A pending `ask` parks this
+	 * session on the user, so the wake text only asks for it when nothing else needs the session.
+	 */
+	function othersBusy(): boolean {
+		if (pending.size > 0) return true;
+		for (const [pane, status] of lastKnown) if (status === "working" && watchedSet.has(pane)) return true;
+		return false;
+	}
+
 	async function listAgents(): Promise<AgentRow[]> {
 		const result = await request("agent.list");
 		const raw = Array.isArray(result.agents) ? result.agents : [];
@@ -471,6 +501,18 @@ export default function herdrWake(pi: ExtensionAPI) {
 		const next = status as Known;
 		const prev = lastKnown.get(paneId);
 		lastKnown.set(paneId, next);
+		if (next === "blocked" && watchedSet.has(paneId) && (explicit.get(paneId) ?? DEFAULT_UNTIL).has("blocked")) {
+			if (!blockedPanes.has(paneId)) {
+				blockedPanes.add(paneId);
+				showBlocked();
+				if (!fromSnapshot) {
+					const who = `${paneId} (${labels.get(paneId) ?? "agent"})`;
+					ctxRef?.ui.notify(`herdr-wake: ${who} is blocked and waiting on you. /herdr focus jumps to it.`, "warning");
+				}
+			}
+		} else if (blockedPanes.delete(paneId)) {
+			showBlocked();
+		}
 		if (next === "working") {
 			// went back to work before the wake fired: stale
 			if (pending.delete(paneId)) {
@@ -508,6 +550,13 @@ export default function herdrWake(pi: ExtensionAPI) {
 		}
 		for (const id of [...lastKnown.keys()]) if (!live.has(id)) lastKnown.delete(id);
 		for (const id of [...paneWorkspace.keys()]) if (!live.has(id)) paneWorkspace.delete(id);
+		let unblocked = false;
+		for (const id of [...blockedPanes]) {
+			if (live.has(id) && watchedSet.has(id)) continue;
+			blockedPanes.delete(id);
+			unblocked = true;
+		}
+		if (unblocked) showBlocked();
 	}
 
 	function capReached(now: number): boolean {
@@ -534,7 +583,7 @@ export default function herdrWake(pi: ExtensionAPI) {
 			throttled = false;
 			capNotified = false;
 		}
-		const content = prompt.render(wakeTemplate, { digest: delivery === "digest", panes });
+		const content = prompt.render(wakeTemplate, { digest: delivery === "digest", panes, busyElsewhere: othersBusy() });
 		const details = { delivery, panes: panes.map(({ pane, workspace, from, to }) => ({ pane, workspace, from, to })) };
 		try {
 			pi.logger.debug("herdr-wake: wake", details);
@@ -787,6 +836,8 @@ export default function herdrWake(pi: ExtensionAPI) {
 	function stop(): void {
 		stopped = true;
 		running = false;
+		blockedPanes.clear();
+		showBlocked();
 		clearTimer(flushTimer);
 		clearTimer(refreshTimer);
 		clearTimer(retryTimer);
@@ -884,7 +935,11 @@ export default function herdrWake(pi: ExtensionAPI) {
 				autoSeen = signature;
 				wakeTimes.push(Date.now());
 				const content = prompt
-					.render(checkTemplate, { scheduled: true, snapshot: prompt.render(statusTemplate, snap).trim() })
+					.render(checkTemplate, {
+						scheduled: true,
+						busyElsewhere: reviewBusy(snap),
+						snapshot: prompt.render(statusTemplate, snap).trim(),
+					})
 					.trim();
 				const details = { delivery: "check", panes: snap.panes.map(({ pane, status }) => ({ pane, status })) };
 				try {
@@ -930,11 +985,41 @@ export default function herdrWake(pi: ExtensionAPI) {
 		};
 	}
 
+	/** The review prompt asks for `ask` only when no pane is still working and nothing is queued. */
+	function reviewBusy(snap: HerdrSnapshot): boolean {
+		return snap.queued > 0 || snap.panes.some(p => p.status === "working");
+	}
+
+	/** `/herdr focus [pane]`: jump to a pane (default: the oldest blocked one) so the user can answer it there. */
+	async function focusPane(target: string | undefined, ctx: ExtensionContext): Promise<void> {
+		const want = target ?? [...blockedPanes][0];
+		if (!want) {
+			ctx.ui.notify("herdr-wake: no blocked pane to jump to. Usage: /herdr focus <pane>", "info");
+			return;
+		}
+		try {
+			const matches = await resolveTarget(want);
+			if (matches.length !== 1) {
+				const problem =
+					matches.length === 0
+						? `no live agent pane matches ${want}`
+						: `${want} is ambiguous (${matches.map(m => m.pane_id).join(", ")}); use a pane id`;
+				ctx.ui.notify(`herdr-wake: ${problem}.`, "warning");
+				return;
+			}
+			await request("agent.focus", { target: matches[0]!.pane_id });
+			ctx.ui.notify(`herdr-wake: focused ${matches[0]!.pane_id}`, "info");
+		} catch (e) {
+			ctx.ui.notify(`herdr-wake: could not focus ${want}: ${e instanceof Error ? e.message : String(e)}`, "error");
+		}
+	}
+
 	function registerHerdrCommand(): void {
 		const subcommands = [
 			{ value: "status", label: "status", description: "List open agent panes and how they are watched" },
 			{ value: "check", label: "check", description: "Ask the model to review every open agent pane" },
 			{ value: "auto", label: "auto", description: "Review open agent panes on a cadence: auto [10m|off]" },
+			{ value: "focus", label: "focus", description: "Jump to a blocked pane: focus [<pane>]" },
 		];
 		pi.registerCommand("herdr", {
 			description: "List open herdr agent panes; `check` asks the model to review them, `auto` repeats that on a cadence",
@@ -944,14 +1029,21 @@ export default function herdrWake(pi: ExtensionAPI) {
 					ctx.ui.notify("herdr-wake is not running in this session (start omp inside herdr with --herdr-wake).", "warning");
 					return;
 				}
-				const [sub = "status", arg, ...extra] = args.trim().toLowerCase().split(/\s+/).filter(Boolean);
-				if (extra.length > 0 || (sub !== "auto" && arg !== undefined) || !subcommands.some(s => s.value === sub)) {
-					ctx.ui.notify("Usage: /herdr [status|check|auto [<interval>|off]]", "warning");
+				// Only the subcommand and the interval are case-insensitive: pane ids are not (`w2X:p1`).
+				const [first = "status", rest, ...extra] = args.trim().split(/\s+/).filter(Boolean);
+				const sub = first.toLowerCase();
+				const arg = sub === "auto" ? rest?.toLowerCase() : rest;
+				if (extra.length > 0 || (sub !== "auto" && sub !== "focus" && arg !== undefined) || !subcommands.some(s => s.value === sub)) {
+					ctx.ui.notify("Usage: /herdr [status|check|auto [<interval>|off]|focus [<pane>]]", "warning");
 					return;
 				}
 				if (sub === "auto") {
 					const { message, level } = setAuto(arg);
 					ctx.ui.notify(message, level);
+					return;
+				}
+				if (sub === "focus") {
+					await focusPane(arg, ctx);
 					return;
 				}
 				let snap: HerdrSnapshot;
@@ -963,7 +1055,7 @@ export default function herdrWake(pi: ExtensionAPI) {
 				}
 				if (sub === "check") {
 					const status = prompt.render(statusTemplate, snap).trim();
-					pi.sendUserMessage(prompt.render(checkTemplate, { snapshot: status }).trim());
+					pi.sendUserMessage(prompt.render(checkTemplate, { snapshot: status, busyElsewhere: reviewBusy(snap) }).trim());
 				} else {
 					ctx.ui.notify(prompt.render(statusTemplate, { ...snap, auto: describeAuto() }).trim(), "info");
 				}
@@ -1033,6 +1125,8 @@ export default function herdrWake(pi: ExtensionAPI) {
 					explicit.delete(row.pane_id);
 					explicitMode.delete(row.pane_id);
 					pending.delete(row.pane_id);
+					blockedPanes.delete(row.pane_id);
+					showBlocked();
 					muted.add(row.pane_id);
 					updateStatus();
 					scheduleRefresh();
