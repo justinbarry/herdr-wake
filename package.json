@@ -1,25 +1,33 @@
 {
 	"name": "herdr-wake",
-	"version": "0.1.0",
-	"description": "omp extension: wake an omp session when watched herdr agent panes finish or block",
-	"type": "module",
-	"private": true,
-	"omp": {
-		"extensions": ["./index.ts"]
+	"author": "Justin Barry",
+	"license": "MIT",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/justinbarry/herdr-wake.git"
 	},
-	"files": ["index.ts", "*.md", "md.d.ts"],
+	"homepage": "https://github.com/justinbarry/herdr-wake#readme",
+	"bugs": {
+		"url": "https://github.com/justinbarry/herdr-wake/issues"
+	},
+	"version": "0.1.0",
+	"description": "Wake an OMP session when watched herdr agent panes finish or block, so one session can manage the agents beside it",
+	"keywords": ["omp", "oh-my-pi", "herdr", "agents", "orchestration", "plugin"],
+	"type": "module",
+	"files": ["src", "types", "README.md", "LICENSE"],
 	"scripts": {
-		"check": "tsc -p tsconfig.json --noEmit"
+		"test": "bun test",
+		"check:types": "bun run --bun tsc --noEmit"
 	},
 	"peerDependencies": {
-		"@oh-my-pi/pi-coding-agent": "*",
-		"@oh-my-pi/pi-utils": "*"
+		"@oh-my-pi/pi-coding-agent": ">=18.4.9",
+		"@oh-my-pi/pi-utils": ">=18.4.9"
 	},
 	"devDependencies": {
-		"@oh-my-pi/pi-coding-agent": "^18.13.3",
-		"@oh-my-pi/pi-utils": "^18.13.3",
 		"@types/bun": "latest",
-		"@types/node": "latest",
-		"typescript": "latest"
+		"typescript": "^5.0.0"
+	},
+	"omp": {
+		"extensions": ["./src/index.ts"]
 	}
 }

@@ -1,8 +1,8 @@
 // herdr-wake: wake this omp session when watched herdr panes change agent state.
 //
-// Armed per process with `omp --herdr-wake`; inert otherwise (and outside herdr).
-// Lives beside the herdr-managed `herdr-omp-agent-state.ts` (which reports omp's own
-// state outward) and never edits it. Extension-only: no omp core changes.
+// Armed per process with `omp --herdr-wake`; inert otherwise (and outside herdr). Pure extension:
+// it talks to herdr's socket directly and needs no omp or herdr changes. It only reads herdr state;
+// herdr's own omp integration (which reports this session's state outward) is unaffected.
 //
 // Flow: herdr socket `events.subscribe` -> per-pane queue -> debounce -> `pi.sendMessage`.
 // Settled (idle/done) updates wait in the queue while this session is mid-turn and go out as one
@@ -25,10 +25,10 @@
 import net from "node:net";
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import { formatDuration, prompt } from "@oh-my-pi/pi-utils";
-import checkTemplate from "./check.md" with { type: "text" };
-import managerGuidance from "./manager.md" with { type: "text" };
-import statusTemplate from "./status.md" with { type: "text" };
-import wakeTemplate from "./wake.md" with { type: "text" };
+import checkTemplate from "./prompts/check.md" with { type: "text" };
+import managerGuidance from "./prompts/manager.md" with { type: "text" };
+import statusTemplate from "./prompts/status.md" with { type: "text" };
+import wakeTemplate from "./prompts/wake.md" with { type: "text" };
 
 const FLAG = "herdr-wake";
 const STATUS_KEY = "herdr-wake";
