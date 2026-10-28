@@ -1,0 +1,25 @@
+{
+	"name": "herdr-wake",
+	"version": "0.1.0",
+	"description": "omp extension: wake an omp session when watched herdr agent panes finish or block",
+	"type": "module",
+	"private": true,
+	"omp": {
+		"extensions": ["./index.ts"]
+	},
+	"files": ["index.ts", "*.md", "md.d.ts"],
+	"scripts": {
+		"check": "tsc -p tsconfig.json --noEmit"
+	},
+	"peerDependencies": {
+		"@oh-my-pi/pi-coding-agent": "*",
+		"@oh-my-pi/pi-utils": "*"
+	},
+	"devDependencies": {
+		"@oh-my-pi/pi-coding-agent": "^18.13.3",
+		"@oh-my-pi/pi-utils": "^18.13.3",
+		"@types/bun": "latest",
+		"@types/node": "latest",
+		"typescript": "latest"
+	}
+}
