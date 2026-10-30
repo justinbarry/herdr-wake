@@ -1,27 +1,29 @@
 // herdr-wake: wake this omp session when watched herdr panes change agent state.
 //
 // Armed per process with `omp --herdr-wake`; inert otherwise (and outside herdr). Pure extension:
-// it talks to herdr's socket directly and needs no omp or herdr changes. It only reads herdr state;
-// herdr's own omp integration (which reports this session's state outward) is unaffected.
+// it talks to herdr's socket directly and needs no omp or herdr changes. It advertises a display-only
+// `herdr_wake: "manager"` pane token while armed (and clears it on shutdown) so peer managers in the
+// same repo skip each other; herdr's own omp lifecycle integration is unaffected.
 //
 // Flow: herdr socket `events.subscribe` -> per-pane queue -> debounce -> `pi.sendMessage`.
-// Settled (idle/done) updates wait in the queue while this session is mid-turn and go out as one
-// batched wake once it is idle; `blocked` alerts are injected at the next step boundary (`aside`);
+// Settled (idle/done) updates wait in the queue while this session is mid-turn (or while the user is
+// typing in the composer, reviewing a plan, or within the 15s post-Esc abort cooldown) and go out as
+// one batched wake once free; `blocked` alerts are injected at the next step boundary (`aside`);
 // panes watched with `mode: "digest"` ride along on the next turn instead of starting one. Queued
 // entries are re-checked against live `agent.list` before they spend a turn, and the wake rate cap
 // defers queued updates instead of dropping them.
-// The wake text is status-only. Pane text is untrusted and is never injected; the model
-// reads it itself (`herdr agent read`) and may delegate heavy inspection to `task`.
+// The wake text is status-only (pane ids, transitions, live working duration, focus flag). Pane text
+// is untrusted and is never injected; the model reads it itself (`herdr agent read`) and may delegate
+// heavy inspection to `task`.
 //
-// Scope: other agent panes in this workspace and in the rest of its worktree group: the primary
-// workspace and its linked-worktree workspaces, i.e. every workspace on the same repo. While armed
-// it also adds a standing manager preference to the system prompt (manager.md): prefer a
-// linked-worktree workspace per delegated task.
+// Scope: other non-manager agent panes in this workspace and in the rest of its worktree group: the
+// primary workspace and its linked-worktree workspaces, i.e. every workspace on the same repo. Watch
+// settings, mutes, and the `/herdr auto` cadence persist in the session across `--resume`.
 //
 // `/herdr` lists the open agent panes and how they are watched (local, no model turn);
-// `/herdr check` submits the same snapshot with a review prompt (check.md) to the model;
-// `/herdr auto [interval|off]` repeats that review on a cadence; a tick that lands while this
-// session is busy is dropped, never delayed.
+// `/herdr mute <pane>` and `/herdr unmute <pane>` silence or restore panes;
+// `/herdr check` submits the snapshot with a review prompt (check.md) to the model;
+// `/herdr auto [interval|off]` reviews only unreviewed completed/blocked transitions on a cadence.
 import net from "node:net";
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import { formatDuration, prompt } from "@oh-my-pi/pi-utils";
@@ -34,24 +36,39 @@ const FLAG = "herdr-wake";
 const STATUS_KEY = "herdr-wake";
 const WIDGET_KEY = "herdr-wake";
 const WAKE_TYPE = "herdr-wake";
+const STATE_ENTRY_TYPE = "herdr-wake-state";
+const MANAGER_TOKEN = "herdr_wake";
 
 const DEBOUNCE_MS = 750; // coalesce flapping panes into one wake
 const IDLE_SETTLE_MS = 100; // wait for AgentSession.#endInFlight() after agent_end
 const IDLE_POLL_MS = 1_000; // backup poll while settled wakes wait for manager idle
+const ABORT_COOLDOWN_MS = 15_000; // yield to the user after Esc / cancelled ask before firing idle wakes
 const REFRESH_DEBOUNCE_MS = 200; // coalesce pane lifecycle bursts into one resync
 const BACKOFF_BASE_MS = 500;
 const BACKOFF_MAX_MS = 15_000;
 const WAKE_WINDOW_MS = 10 * 60_000; // circuit breaker: agent <-> agent ping-pong guard
 const WAKE_CAP = 20;
 const REQUEST_TIMEOUT_MS = 3_000;
+const SHUTDOWN_TIMEOUT_MS = 250;
 const AUTO_DEFAULT_MS = 10 * 60_000; // `/herdr auto` without an interval
 const AUTO_MIN_MS = 60_000; // every tick can cost a model turn
 const AUTO_MAX_MS = 24 * 3_600_000;
 
-// Lifecycle events that change which panes exist or which are agents. The server also
-// names some of them with an underscore (`pane_created`), so names are normalized below.
-const LIFECYCLE = ["pane.created", "pane.closed", "pane.exited", "pane.moved", "pane.agent_detected"];
-
+// Lifecycle events that change which panes/workspaces exist or which are agents. The server
+// also names some of them with an underscore (`pane_created`), so names are normalized below.
+const LIFECYCLE = [
+	"pane.created",
+	"pane.closed",
+	"pane.exited",
+	"pane.moved",
+	"pane.agent_detected",
+	"workspace.created",
+	"workspace.renamed",
+	"workspace.closed",
+	"worktree.created",
+	"worktree.opened",
+	"worktree.removed",
+];
 type Known = "working" | "idle" | "done" | "blocked";
 const KNOWN: ReadonlySet<string> = new Set(["working", "idle", "done", "blocked"]);
 const DEFAULT_UNTIL: ReadonlySet<string> = new Set(["idle", "done", "blocked"]);
@@ -65,6 +82,8 @@ type Delivery = "wake" | "aside" | "digest";
 interface PendingWake {
 	from: Known | "unknown";
 	to: Known;
+	/** Time spent in `working` before this transition, when observed live. */
+	workedMs?: number;
 	/** Bumped on every observed transition; tells a flush whether an event landed while it awaited. */
 	gen: number;
 }
@@ -75,6 +94,9 @@ interface WakeRow {
 	workspace: string | undefined;
 	from: Known | "unknown";
 	to: Known;
+	worked?: string;
+	focused?: boolean;
+	meta?: string;
 }
 
 interface PaneStatus {
@@ -82,8 +104,28 @@ interface PaneStatus {
 	label: string;
 	workspace: string | undefined;
 	status: string;
+	focused?: boolean;
 	watch: string;
 	queued: string | undefined;
+}
+
+interface ReviewedPane {
+	state: "settled" | "blocked";
+	completionSeq?: number;
+	stateChangeSeq?: number;
+}
+
+interface PersistedWatch {
+	pane: string;
+	until: Known[];
+	mode?: WatchMode;
+}
+
+interface PersistedState {
+	v: 1;
+	autoMs: number;
+	muted: string[];
+	watches: PersistedWatch[];
 }
 
 // A type alias, not an interface: prompt.render needs the implicit string index signature.
@@ -122,6 +164,10 @@ interface AgentRow {
 	agent?: string;
 	/** What wake messages show: the name when assigned, else the kind. */
 	label?: string;
+	focused?: boolean;
+	completion_seq?: number;
+	state_change_seq?: number;
+	tokens?: Record<string, string>;
 }
 
 interface Sub {
@@ -155,6 +201,18 @@ function parse(line: string): Record<string, unknown> | undefined {
 	}
 }
 
+function tokenMap(value: unknown): Record<string, string> | undefined {
+	if (!isRecord(value)) return undefined;
+	let out: Record<string, string> | undefined;
+	for (const [k, v] of Object.entries(value)) {
+		if (typeof v === "string") {
+			out ??= {};
+			out[k] = v;
+		}
+	}
+	return out;
+}
+
 function toAgentRow(value: unknown): AgentRow | undefined {
 	if (!isRecord(value)) return undefined;
 	const pane_id = str(value.pane_id);
@@ -168,6 +226,18 @@ function toAgentRow(value: unknown): AgentRow | undefined {
 		name,
 		agent,
 		label: name ?? agent,
+		focused: typeof value.focused === "boolean" ? value.focused : undefined,
+		completion_seq:
+			typeof value.completion_seq === "number" && Number.isInteger(value.completion_seq) && value.completion_seq >= 0
+				? value.completion_seq
+				: undefined,
+		state_change_seq:
+			typeof value.state_change_seq === "number" &&
+			Number.isInteger(value.state_change_seq) &&
+			value.state_change_seq >= 0
+				? value.state_change_seq
+				: undefined,
+		tokens: tokenMap(value.tokens),
 	};
 }
 
@@ -192,7 +262,11 @@ function lines(onLine: (line: string) => void): (chunk: string) => void {
 let reqSeq = 0;
 
 /** One request, one reply, then the connection is dropped. */
-function request(method: string, params: Record<string, unknown> = {}): Promise<Record<string, unknown>> {
+function request(
+	method: string,
+	params: Record<string, unknown> = {},
+	timeoutMs = REQUEST_TIMEOUT_MS,
+): Promise<Record<string, unknown>> {
 	const { promise, resolve, reject } = Promise.withResolvers<Record<string, unknown>>();
 	const id = `${WAKE_TYPE}:${++reqSeq}`;
 	const socket = net.createConnection(endpoint!);
@@ -206,7 +280,7 @@ function request(method: string, params: Record<string, unknown> = {}): Promise<
 		if (err) reject(err);
 		else resolve(value ?? {});
 	};
-	const timer = setTimeout(() => finish(new Error(`${method} timed out`)), REQUEST_TIMEOUT_MS);
+	const timer = setTimeout(() => finish(new Error(`${method} timed out`)), timeoutMs);
 	timer.unref?.();
 	socket.on("connect", () => socket.write(`${JSON.stringify({ id, method, params })}\n`));
 	socket.on(
@@ -312,8 +386,14 @@ export default function herdrWake(pi: ExtensionAPI) {
 	let subscribedKey = "";
 	let watchedSet: ReadonlySet<string> = new Set();
 	let workspaceId = process.env.HERDR_WORKSPACE_ID;
+	let scopeWarned = false;
 
 	const lastKnown = new Map<string, Known>();
+	const workingSince = new Map<string, number>();
+	const lastCompletionSeq = new Map<string, number>();
+	const lastStateSeq = new Map<string, number>();
+	const lastFocused = new Map<string, boolean>();
+	const lastEventSeq = new Map<string, number>();
 	const labels = new Map<string, string>();
 	const explicit = new Map<string, ReadonlySet<string>>(); // pane id -> states that wake
 	const muted = new Set<string>();
@@ -323,6 +403,7 @@ export default function herdrWake(pi: ExtensionAPI) {
 	const pending = new Map<string, PendingWake>();
 	let pendingSeq = 0;
 	let flushDueAt = 0;
+	let abortHoldUntil = 0;
 	let throttled = false;
 	let flushing = false;
 	let flushAgain = false;
@@ -330,7 +411,7 @@ export default function herdrWake(pi: ExtensionAPI) {
 	let autoTimer: TimerHandle | undefined;
 	let autoDueAt = 0; // next tick
 	let autoGen = 0; // bumped on every on/off/shutdown: an in-flight tick from an older schedule must not dispatch
-	let autoSeen: string | undefined; // pane states at the last review; unchanged states are not reviewed again
+	const autoReviewed = new Map<string, ReviewedPane>(); // per-pane reviewed state so unchanged/event-delivered panes do not re-trigger auto
 	let wakeTimes: number[] = [];
 	let capNotified = false;
 
@@ -340,10 +421,9 @@ export default function herdrWake(pi: ExtensionAPI) {
 	let flushTimer: TimerHandle | undefined;
 	let refreshTimer: TimerHandle | undefined;
 	let retryTimer: TimerHandle | undefined;
-	/** workspace id -> git/worktree facts from workspace.list */
+	/** workspace id -> git/worktree facts from session.snapshot / workspace.list */
 	const workspaces = new Map<string, { repoKey?: string; label?: string }>();
 	const paneWorkspace = new Map<string, string>();
-
 	function logWarn(msg: string, extra?: Record<string, unknown>): void {
 		try {
 			pi.logger.warn(`herdr-wake: ${msg}`, extra);
@@ -430,9 +510,112 @@ export default function herdrWake(pi: ExtensionAPI) {
 		return false;
 	}
 
-	async function listAgents(): Promise<AgentRow[]> {
-		const result = await request("agent.list");
-		const raw = Array.isArray(result.agents) ? result.agents : [];
+	/** Non-zero while an idle session should yield to the user (post-Esc cooldown, composer draft, or plan review). */
+	function userHoldMs(now: number): number {
+		if (now < abortHoldUntil) return Math.max(IDLE_SETTLE_MS, abortHoldUntil - now);
+		try {
+			const draft = ctxRef?.ui.getEditorText?.();
+			if (typeof draft === "string" && draft.trim().length > 0) return IDLE_POLL_MS;
+			if (ctxRef?.getPendingPlanReview?.() !== undefined) return IDLE_POLL_MS;
+		} catch {
+			// optional host UI hooks must never break wake delivery
+		}
+		return 0;
+	}
+
+	function wasTurnAborted(event: unknown): boolean {
+		if (!isRecord(event) || !Array.isArray(event.messages)) return false;
+		for (let i = event.messages.length - 1; i >= 0; i--) {
+			const msg = event.messages[i];
+			if (isRecord(msg) && msg.role === "assistant") {
+				return msg.stopReason === "aborted";
+			}
+		}
+		return false;
+	}
+
+	function persistState(): void {
+		try {
+			const watches: PersistedWatch[] = [];
+			for (const [pane, until] of explicit) {
+				const states = [...until].filter((s): s is Known => DEFAULT_UNTIL.has(s));
+				if (states.length === 0) continue;
+				const mode = explicitMode.get(pane);
+				watches.push(mode === "digest" ? { pane, until: states, mode } : { pane, until: states });
+			}
+			const data: PersistedState = {
+				v: 1,
+				autoMs,
+				muted: [...muted].sort(),
+				watches,
+			};
+			pi.appendEntry?.(STATE_ENTRY_TYPE, data);
+		} catch (e) {
+			logWarn("could not persist state", { error: String(e) });
+		}
+	}
+
+	function restoreState(ctx: ExtensionContext): void {
+		let entries: readonly unknown[] | undefined;
+		try {
+			entries = ctx.sessionManager?.getBranch?.();
+		} catch {
+			return;
+		}
+		if (!Array.isArray(entries)) return;
+		let saved: Record<string, unknown> | undefined;
+		for (const entry of entries) {
+			if (isRecord(entry) && entry.type === "custom" && entry.customType === STATE_ENTRY_TYPE && isRecord(entry.data)) {
+				saved = entry.data;
+			}
+		}
+		muted.clear();
+		explicit.clear();
+		explicitMode.clear();
+		let nextAutoMs = 0;
+		if (saved) {
+			if (
+				typeof saved.autoMs === "number" &&
+				(saved.autoMs === 0 || (saved.autoMs >= AUTO_MIN_MS && saved.autoMs <= AUTO_MAX_MS))
+			) {
+				nextAutoMs = saved.autoMs;
+			}
+			if (Array.isArray(saved.muted)) {
+				for (const item of saved.muted) {
+					const pane = str(item);
+					if (pane && pane !== selfPane) muted.add(pane);
+				}
+			}
+			if (Array.isArray(saved.watches)) {
+				for (const item of saved.watches) {
+					if (!isRecord(item)) continue;
+					const pane = str(item.pane);
+					if (!pane || pane === selfPane || muted.has(pane)) continue;
+					const untilArr = Array.isArray(item.until)
+						? item.until.filter((s): s is string => typeof s === "string" && DEFAULT_UNTIL.has(s))
+						: [];
+					explicit.set(pane, untilArr.length > 0 ? new Set(untilArr) : DEFAULT_UNTIL);
+					if (item.mode === "digest") explicitMode.set(pane, "digest");
+				}
+			}
+		}
+		for (const pane of muted) {
+			pending.delete(pane);
+			blockedPanes.delete(pane);
+			autoReviewed.delete(pane);
+		}
+		if (nextAutoMs !== autoMs || (nextAutoMs > 0 && autoTimer === undefined)) {
+			autoMs = nextAutoMs;
+			autoGen++;
+			autoReviewed.clear();
+			scheduleAuto();
+		}
+		showBlocked();
+		updateStatus();
+	}
+
+	function parseAgents(raw: unknown): AgentRow[] {
+		if (!Array.isArray(raw)) return [];
 		const rows: AgentRow[] = [];
 		for (const item of raw) {
 			const row = toAgentRow(item);
@@ -441,16 +624,8 @@ export default function herdrWake(pi: ExtensionAPI) {
 		return rows;
 	}
 
-	/** Resolves this pane's workspace and the git/worktree facts of every workspace. */
-	async function ensureScope(): Promise<void> {
-		if (!workspaceId) {
-			const pane = await request("pane.get", { pane_id: selfPane });
-			const info = isRecord(pane.pane) ? pane.pane : pane;
-			workspaceId = str(info.workspace_id);
-			if (!workspaceId) logWarn("could not resolve this pane's workspace; only explicit watches apply");
-		}
-		const result = await request("workspace.list");
-		const raw = Array.isArray(result.workspaces) ? result.workspaces : [];
+	function applyWorkspaces(raw: unknown): void {
+		if (!Array.isArray(raw)) return;
 		workspaces.clear();
 		for (const item of raw) {
 			if (!isRecord(item)) continue;
@@ -462,6 +637,62 @@ export default function herdrWake(pi: ExtensionAPI) {
 				label: safeLabel(item.label, 48),
 			});
 		}
+	}
+
+	async function listAgents(): Promise<AgentRow[]> {
+		const result = await request("agent.list");
+		return parseAgents(result.agents);
+	}
+
+	/** Resolves this pane's workspace and the git/worktree facts of every workspace (fallback when session.snapshot is absent). */
+	async function ensureScope(): Promise<void> {
+		if (!workspaceId) {
+			const pane = await request("pane.get", { pane_id: selfPane });
+			const info = isRecord(pane.pane) ? pane.pane : pane;
+			workspaceId = str(info.workspace_id);
+			if (!workspaceId && !scopeWarned) {
+				scopeWarned = true;
+				logWarn("could not resolve this pane's workspace; only explicit watches apply");
+			}
+		}
+		const result = await request("workspace.list");
+		applyWorkspaces(result.workspaces);
+	}
+
+	/** Reads workspaces, pane scope, and live agents in one `session.snapshot` call when supported. */
+	async function readClusterState(): Promise<AgentRow[]> {
+		try {
+			const result = await request("session.snapshot");
+			const snap = isRecord(result.snapshot) ? result.snapshot : result;
+			if (Array.isArray(snap.agents) && Array.isArray(snap.workspaces)) {
+				applyWorkspaces(snap.workspaces);
+				if (!workspaceId && Array.isArray(snap.panes)) {
+					for (const item of snap.panes) {
+						if (isRecord(item) && item.pane_id === selfPane) {
+							workspaceId = str(item.workspace_id);
+							break;
+						}
+					}
+				}
+				if (!workspaceId) {
+					for (const item of snap.agents) {
+						if (isRecord(item) && item.pane_id === selfPane) {
+							workspaceId = str(item.workspace_id);
+							break;
+						}
+					}
+				}
+				if (!workspaceId && !scopeWarned) {
+					scopeWarned = true;
+					logWarn("could not resolve this pane's workspace; only explicit watches apply");
+				}
+				return parseAgents(snap.agents);
+			}
+		} catch {
+			// fall back to workspace.list + agent.list on older or minimal servers
+		}
+		await ensureScope();
+		return await listAgents();
 	}
 
 	/**
@@ -485,11 +716,56 @@ export default function herdrWake(pi: ExtensionAPI) {
 		const out: string[] = [];
 		for (const a of agents) {
 			if (a.pane_id === selfPane || muted.has(a.pane_id)) continue;
-			if (explicit.has(a.pane_id) || inScope(a.workspace_id)) {
+			if (explicit.has(a.pane_id) || (a.tokens?.[MANAGER_TOKEN] !== "manager" && inScope(a.workspace_id))) {
 				out.push(a.pane_id);
 			}
 		}
 		return out.sort();
+	}
+
+	function recordRowFacts(a: AgentRow): void {
+		if (a.label) labels.set(a.pane_id, a.label);
+		if (a.workspace_id) paneWorkspace.set(a.pane_id, a.workspace_id);
+		if (a.completion_seq !== undefined) lastCompletionSeq.set(a.pane_id, a.completion_seq);
+		if (a.state_change_seq !== undefined) lastStateSeq.set(a.pane_id, a.state_change_seq);
+		if (a.focused !== undefined) lastFocused.set(a.pane_id, a.focused);
+	}
+
+	function normReviewState(status: string | undefined): "settled" | "blocked" | undefined {
+		if (status === "idle" || status === "done") return "settled";
+		if (status === "blocked") return "blocked";
+		return undefined;
+	}
+
+	function markReviewed(pane: string, status: string | undefined, row?: AgentRow): void {
+		const state = normReviewState(status);
+		if (!state) return;
+		if (status && KNOWN.has(status)) {
+			lastKnown.set(pane, status as Known);
+			workingSince.delete(pane);
+		}
+		autoReviewed.set(pane, {
+			state,
+			completionSeq: row?.completion_seq ?? lastCompletionSeq.get(pane),
+			stateChangeSeq: row?.state_change_seq ?? lastStateSeq.get(pane),
+		});
+	}
+
+	function isAlreadyReviewed(row: AgentRow): boolean {
+		const state = normReviewState(row.agent_status);
+		if (!state) return true;
+		const prev = autoReviewed.get(row.pane_id);
+		if (!prev || prev.state !== state) return false;
+		if (state === "settled") {
+			if (row.completion_seq !== undefined && prev.completionSeq !== undefined) {
+				return row.completion_seq === prev.completionSeq;
+			}
+			return true;
+		}
+		if (row.state_change_seq !== undefined && prev.stateChangeSeq !== undefined) {
+			return row.state_change_seq === prev.stateChangeSeq;
+		}
+		return true;
 	}
 
 	/**
@@ -498,6 +774,8 @@ export default function herdrWake(pi: ExtensionAPI) {
 	 */
 	function observe(paneId: string, status: string | undefined, fromSnapshot: boolean): void {
 		if (!status || paneId === selfPane || !KNOWN.has(status)) return; // `unknown` flickers between states
+		const eventGen = fromSnapshot ? undefined : ++pendingSeq;
+		if (eventGen !== undefined) lastEventSeq.set(paneId, eventGen);
 		const next = status as Known;
 		const prev = lastKnown.get(paneId);
 		lastKnown.set(paneId, next);
@@ -514,6 +792,10 @@ export default function herdrWake(pi: ExtensionAPI) {
 			showBlocked();
 		}
 		if (next === "working") {
+			if (prev !== "working" && !(fromSnapshot && prev === undefined)) {
+				workingSince.set(paneId, Date.now());
+			}
+			autoReviewed.delete(paneId);
 			// went back to work before the wake fired: stale
 			if (pending.delete(paneId)) {
 				if (pending.size === 0) {
@@ -526,6 +808,14 @@ export default function herdrWake(pi: ExtensionAPI) {
 			}
 			return;
 		}
+		let workedMs: number | undefined;
+		if (prev === "working") {
+			const started = workingSince.get(paneId);
+			workingSince.delete(paneId);
+			if (started !== undefined) workedMs = Math.max(0, Date.now() - started);
+		} else if (!fromSnapshot) {
+			workingSince.delete(paneId);
+		}
 		if (fromSnapshot && prev === undefined) return;
 		if (!watchedSet.has(paneId)) return;
 		const until = explicit.get(paneId) ?? DEFAULT_UNTIL;
@@ -533,22 +823,36 @@ export default function herdrWake(pi: ExtensionAPI) {
 		const fire = until.has(next) && ((settled && prev === "working") || (next === "blocked" && prev !== "blocked"));
 		if (!fire) return;
 		const held = pending.get(paneId);
-		pending.set(paneId, { from: held?.from ?? prev ?? "unknown", to: next, gen: ++pendingSeq });
+		pending.set(paneId, {
+			from: held?.from ?? prev ?? "unknown",
+			to: next,
+			workedMs: workedMs ?? held?.workedMs,
+			gen: eventGen ?? ++pendingSeq,
+		});
 		updateStatus();
 		// A `blocked` alert never waits behind a longer idle-poll deadline; a throttled queue keeps its retry time.
 		scheduleFlush(DEBOUNCE_MS, !throttled && next === "blocked");
 	}
 
-	/** Applies one agent.list read: labels, transitions against what we last saw, pruning. */
+	/** Applies one agent read: labels, sequence/focus metadata, transitions against what we last saw, pruning. */
 	function sync(agents: AgentRow[]): void {
 		const live = new Set<string>();
 		for (const a of agents) {
 			live.add(a.pane_id);
-			if (a.label) labels.set(a.pane_id, a.label);
-			if (a.workspace_id) paneWorkspace.set(a.pane_id, a.workspace_id);
+			recordRowFacts(a);
 			observe(a.pane_id, a.agent_status, true);
 		}
-		for (const id of [...lastKnown.keys()]) if (!live.has(id)) lastKnown.delete(id);
+		for (const id of [...lastKnown.keys()]) {
+			if (!live.has(id)) {
+				lastKnown.delete(id);
+				workingSince.delete(id);
+				lastCompletionSeq.delete(id);
+				lastStateSeq.delete(id);
+				lastFocused.delete(id);
+				lastEventSeq.delete(id);
+				autoReviewed.delete(id);
+			}
+		}
 		for (const id of [...paneWorkspace.keys()]) if (!live.has(id)) paneWorkspace.delete(id);
 		let unblocked = false;
 		for (const id of [...blockedPanes]) {
@@ -584,7 +888,17 @@ export default function herdrWake(pi: ExtensionAPI) {
 			capNotified = false;
 		}
 		const content = prompt.render(wakeTemplate, { digest: delivery === "digest", panes, busyElsewhere: othersBusy() });
-		const details = { delivery, panes: panes.map(({ pane, workspace, from, to }) => ({ pane, workspace, from, to })) };
+		const details = {
+			delivery,
+			panes: panes.map(({ pane, workspace, from, to, worked, focused }) => ({
+				pane,
+				workspace,
+				from,
+				to,
+				...(worked ? { worked } : {}),
+				...(focused ? { focused: true } : {}),
+			})),
+		};
 		try {
 			pi.logger.debug("herdr-wake: wake", details);
 		} catch {
@@ -618,6 +932,14 @@ export default function herdrWake(pi: ExtensionAPI) {
 		}
 		const needsActive = hasBlocked || [...pending.keys()].some(p => (explicitMode.get(p) ?? "wake") === "wake");
 		let now = Date.now();
+		if (wasIdle && needsActive) {
+			const hold = userHoldMs(now);
+			if (hold > 0) {
+				throttled = false;
+				scheduleFlush(hold);
+				return;
+			}
+		}
 		if (needsActive && capReached(now)) {
 			holdForCap(now);
 			return;
@@ -631,7 +953,7 @@ export default function herdrWake(pi: ExtensionAPI) {
 			logWarn("freshness listAgents failed, using cached state", { error: String(e) });
 		}
 		if (stopped) return;
-		// The user may have submitted a prompt while the list was in flight.
+		// The user may have submitted a prompt or started typing while the list was in flight.
 		const nowIdle = ctxRef?.isIdle() === true;
 
 		const asideBatch: WakeRow[] = [];
@@ -645,21 +967,27 @@ export default function herdrWake(pi: ExtensionAPI) {
 				continue;
 			}
 			let to = cur.to;
+			let liveRow: AgentRow | undefined;
 			if (liveByPane) {
 				// A newer event landed during the read; the list may predate it, so recheck next flush.
 				if (cur.gen !== snap.gen) continue;
-				const live = liveByPane.get(pane);
-				if (!live || live.agent_status === "working") {
+				liveRow = liveByPane.get(pane);
+				if (!liveRow || liveRow.agent_status === "working") {
 					pending.delete(pane);
-					if (live) lastKnown.set(pane, "working");
-					else lastKnown.delete(pane);
+					if (liveRow) {
+						recordRowFacts(liveRow);
+						lastKnown.set(pane, "working");
+						autoReviewed.delete(pane);
+					} else {
+						lastKnown.delete(pane);
+						autoReviewed.delete(pane);
+					}
 					continue;
 				}
-				if (live.label) labels.set(pane, live.label);
-				if (live.workspace_id) paneWorkspace.set(pane, live.workspace_id);
+				recordRowFacts(liveRow);
 				// herdr's transient `unknown` is not in KNOWN, so it keeps the queued state.
-				if (live.agent_status && KNOWN.has(live.agent_status)) {
-					to = live.agent_status as Known;
+				if (liveRow.agent_status && KNOWN.has(liveRow.agent_status)) {
+					to = liveRow.agent_status as Known;
 					lastKnown.set(pane, to);
 				}
 			}
@@ -668,12 +996,20 @@ export default function herdrWake(pi: ExtensionAPI) {
 				continue;
 			}
 			if (to !== cur.to) pending.set(pane, { ...cur, to }); // not a new event: same gen
+			const worked = cur.workedMs ? formatDuration(cur.workedMs) : undefined;
+			const focused = (liveRow?.focused ?? lastFocused.get(pane)) === true;
+			const metaParts: string[] = [];
+			if (worked) metaParts.push(`worked ${worked}`);
+			if (focused) metaParts.push("focused");
 			const entry: WakeRow = {
 				pane,
 				label: labels.get(pane) ?? "agent",
 				workspace: workspaceLabel(pane),
 				from: cur.from,
 				to,
+				worked,
+				focused: focused || undefined,
+				meta: metaParts.length > 0 ? metaParts.join(", ") : undefined,
 			};
 			if (!nowIdle) {
 				if (to === "blocked") asideBatch.push(entry); // settled entries stay queued until idle
@@ -685,15 +1021,29 @@ export default function herdrWake(pi: ExtensionAPI) {
 		}
 
 		now = Date.now();
-		if (asideBatch.length + activeBatch.length > 0 && capReached(now)) {
-			holdForCap(now); // live state can promote a queued digest entry to `blocked`: recheck the cap
-			return;
+		if (asideBatch.length + activeBatch.length > 0) {
+			if (nowIdle) {
+				const hold = userHoldMs(now);
+				if (hold > 0) {
+					throttled = false;
+					scheduleFlush(hold);
+					return;
+				}
+			}
+			if (capReached(now)) {
+				holdForCap(now); // live state can promote a queued digest entry to `blocked`: recheck the cap
+				return;
+			}
 		}
 		for (const batch of [asideBatch, activeBatch, digestBatch]) for (const entry of batch) pending.delete(entry.pane);
-		if (asideBatch.length > 0) sendBatch(asideBatch, "aside");
+		if (asideBatch.length > 0) {
+			for (const entry of asideBatch) markReviewed(entry.pane, entry.to, liveByPane?.get(entry.pane));
+			sendBatch(asideBatch, "aside");
+		}
 		if (activeBatch.length > 0) {
 			// A turn is about to start anyway: one combined message beats two adjacent ones.
 			activeBatch.push(...digestBatch);
+			for (const entry of activeBatch) markReviewed(entry.pane, entry.to, liveByPane?.get(entry.pane));
 			sendBatch(activeBatch, "wake");
 		} else if (digestBatch.length > 0) {
 			sendBatch(digestBatch, "digest");
@@ -780,15 +1130,15 @@ export default function herdrWake(pi: ExtensionAPI) {
 	 * any transition that happened in the gap.
 	 */
 	async function refreshOnce(): Promise<void> {
-		await ensureScope();
-		let agents = await listAgents();
+		let agents = await readClusterState();
 		for (let i = 0; i < 3 && !stopped; i++) {
 			const want = desired(agents);
 			const key = want.join(",");
 			watchedSet = new Set(want);
 			sync(agents);
-			if (!conn || key !== subscribedKey) await resubscribe(want, key);
-			agents = await listAgents();
+			if (conn && key === subscribedKey) return;
+			await resubscribe(want, key);
+			agents = await readClusterState();
 			sync(agents);
 			if (desired(agents).join(",") === subscribedKey) return;
 		}
@@ -843,6 +1193,7 @@ export default function herdrWake(pi: ExtensionAPI) {
 		clearTimer(retryTimer);
 		flushTimer = refreshTimer = retryTimer = undefined;
 		flushDueAt = 0;
+		abortHoldUntil = 0;
 		throttled = false;
 		flushing = false;
 		flushAgain = false;
@@ -851,7 +1202,8 @@ export default function herdrWake(pi: ExtensionAPI) {
 		autoDueAt = 0;
 		autoMs = 0;
 		autoGen++;
-		autoSeen = undefined;
+		autoReviewed.clear();
+		workingSince.clear();
 		connGen++;
 		conn?.close();
 		conn = undefined;
@@ -862,30 +1214,39 @@ export default function herdrWake(pi: ExtensionAPI) {
 	}
 
 	/** Live agent panes (other than this one) and how herdr-wake treats each; rendered by status.md. */
-	async function snapshot(): Promise<HerdrSnapshot> {
+	async function readSnapshot(): Promise<{ snap: HerdrSnapshot; rows: AgentRow[]; seqBefore: number }> {
+		const seqBefore = pendingSeq;
 		const rows = (await listAgents()).filter(a => a.pane_id !== selfPane);
 		const panes = rows.map((a): PaneStatus => {
+			if ((lastEventSeq.get(a.pane_id) ?? 0) <= seqBefore) recordRowFacts(a);
 			let watch = "not watched";
 			if (muted.has(a.pane_id)) {
 				watch = "muted";
 			} else if (watchedSet.has(a.pane_id)) {
 				watch = [...(explicit.get(a.pane_id) ?? DEFAULT_UNTIL)].join("|");
 				if ((explicitMode.get(a.pane_id) ?? "wake") === "digest") watch += " (digest)";
+			} else if (a.tokens?.[MANAGER_TOKEN] === "manager") {
+				watch = "manager (not watched)";
 			}
 			const held = pending.get(a.pane_id);
 			return {
 				pane: a.pane_id,
-				label: a.label ?? "agent",
+				label: labels.get(a.pane_id) ?? a.label ?? "agent",
 				workspace:
 					a.workspace_id && a.workspace_id !== workspaceId
 						? (workspaces.get(a.workspace_id)?.label ?? safeLabel(a.workspace_id, 48))
 						: undefined,
 				status: safeLabel(a.agent_status) ?? "unknown",
+				focused: a.focused === true || undefined,
 				watch,
 				queued: held ? `${held.from} -> ${held.to}` : undefined,
 			};
 		});
-		return { agents: panes.length, watched: watchedSet.size, queued: pending.size, throttled, panes };
+		return {
+			snap: { agents: panes.length, watched: watchedSet.size, queued: pending.size, throttled, panes },
+			rows,
+			seqBefore,
+		};
 	}
 
 	function describeAuto(): string | undefined {
@@ -910,50 +1271,83 @@ export default function herdrWake(pi: ExtensionAPI) {
 
 	/**
 	 * `/herdr auto` tick: submit a scheduled review to the model. A tick that lands while this session is
-	 * busy is dropped, not delayed: the next one reads live state again. Otherwise it reviews only when a
-	 * pane needs a look (one that is not `working`, or has an update held in the queue) and the pane states
-	 * differ from the last review. It spends a slot of the same wake budget as event wakes; at the cap the
-	 * tick is skipped too.
+	 * busy or yielding to the user is dropped, not delayed: the next one reads live state again. Otherwise
+	 * it reviews only watched panes with unreviewed completed (`completion_seq`) or `blocked` transitions,
+	 * skipping `done -> idle` sight flips, pane closures, `-> working` transitions, and transitions already
+	 * delivered by an event wake. It shares the wake rate cap; at the cap the tick is skipped.
 	 */
 	async function autoCheck(): Promise<void> {
 		if (stopped || autoMs === 0) return;
 		scheduleAuto(); // the next tick is a full interval away whatever this one does
-		if (ctxRef?.isIdle() !== true) return;
+		if (ctxRef?.isIdle() !== true || userHoldMs(Date.now()) > 0) return;
 		const gen = autoGen;
 		try {
-			const snap = await snapshot();
-			// Switched off or re-armed while the list was in flight, or a turn started meanwhile: drop it.
-			if (stopped || gen !== autoGen || ctxRef?.isIdle() !== true) return;
-			const needsLook = snap.queued > 0 || snap.panes.some(p => p.status !== "working");
-			const signature = snap.panes
-				.map(p => `${p.pane}:${p.status}:${p.queued ?? ""}`)
-				.sort()
-				.join("|");
-			if (!needsLook) {
-				autoSeen = signature;
-			} else if (signature !== autoSeen && !capReached(Date.now())) {
-				autoSeen = signature;
-				wakeTimes.push(Date.now());
-				const content = prompt
-					.render(checkTemplate, {
-						scheduled: true,
-						busyElsewhere: reviewBusy(snap),
-						snapshot: prompt.render(statusTemplate, snap).trim(),
-					})
-					.trim();
-				const details = { delivery: "check", panes: snap.panes.map(({ pane, status }) => ({ pane, status })) };
-				try {
-					pi.logger.debug("herdr-wake: auto-check", details);
-				} catch {
-					// logging must never take the session down
+			const { snap, rows, seqBefore } = await readSnapshot();
+			// Switched off or re-armed while the list was in flight, or the user/session became busy meanwhile: drop it.
+			if (stopped || gen !== autoGen || ctxRef?.isIdle() !== true || userHoldMs(Date.now()) > 0) return;
+			const liveIds = new Set<string>();
+			const changed: AgentRow[] = [];
+			for (const row of rows) {
+				liveIds.add(row.pane_id);
+				// A live event landed on this pane while the list was in flight: keep its live state and queued wake intact.
+				if ((lastEventSeq.get(row.pane_id) ?? 0) > seqBefore) continue;
+				if (row.agent_status === "working") {
+					autoReviewed.delete(row.pane_id);
+					continue;
 				}
-				Promise.resolve(
-					pi.sendMessage(
-						{ customType: WAKE_TYPE, content, display: true, attribution: "agent", details },
-						DELIVERY_OPTIONS.wake,
-					),
-				).catch(e => logWarn("auto-check send failed", { error: String(e) }));
+				if (!watchedSet.has(row.pane_id) || muted.has(row.pane_id)) continue;
+				const norm = normReviewState(row.agent_status);
+				if (!norm) continue;
+				const allowed = explicit.get(row.pane_id) ?? DEFAULT_UNTIL;
+				const allowedState = norm === "blocked" ? allowed.has("blocked") : allowed.has("idle") || allowed.has("done");
+				if (!allowedState) continue;
+				if (!isAlreadyReviewed(row) || pending.has(row.pane_id)) {
+					changed.push(row);
+				}
 			}
+			for (const id of [...autoReviewed.keys()]) {
+				if (!liveIds.has(id) || !watchedSet.has(id) || muted.has(id)) autoReviewed.delete(id);
+			}
+			const now = Date.now();
+			if (changed.length === 0 || capReached(now)) return;
+			for (const row of changed) {
+				if ((lastEventSeq.get(row.pane_id) ?? 0) > seqBefore) continue;
+				markReviewed(row.pane_id, row.agent_status, row);
+				const cur = pending.get(row.pane_id);
+				if (cur && cur.gen <= seqBefore) pending.delete(row.pane_id);
+			}
+			if (pending.size === 0 && !throttled) {
+				clearTimer(flushTimer);
+				flushTimer = undefined;
+				flushDueAt = 0;
+			}
+			updateStatus();
+			wakeTimes.push(now);
+			const changedPanes = changed.map(r => r.pane_id).join(", ");
+			const content = prompt
+				.render(checkTemplate, {
+					scheduled: true,
+					changedPanes,
+					busyElsewhere: reviewBusy(snap),
+					snapshot: prompt.render(statusTemplate, snap).trim(),
+				})
+				.trim();
+			const details = {
+				delivery: "check",
+				changed: changed.map(r => r.pane_id),
+				panes: snap.panes.map(({ pane, status }) => ({ pane, status })),
+			};
+			try {
+				pi.logger.debug("herdr-wake: auto-check", details);
+			} catch {
+				// logging must never take the session down
+			}
+			Promise.resolve(
+				pi.sendMessage(
+					{ customType: WAKE_TYPE, content, display: true, attribution: "agent", details },
+					DELIVERY_OPTIONS.wake,
+				),
+			).catch(e => logWarn("auto-check send failed", { error: String(e) }));
 		} catch (e) {
 			logWarn("auto-check failed", { error: String(e) });
 		}
@@ -964,8 +1358,9 @@ export default function herdrWake(pi: ExtensionAPI) {
 			const wasOn = autoMs > 0;
 			autoMs = 0;
 			autoGen++;
-			autoSeen = undefined;
+			autoReviewed.clear();
 			scheduleAuto(); // off: clears the timer
+			if (wasOn) persistState();
 			updateStatus();
 			return { message: `herdr-wake: auto-check ${wasOn ? "off" : "is already off"}`, level: "info" };
 		}
@@ -974,10 +1369,12 @@ export default function herdrWake(pi: ExtensionAPI) {
 		if (ms === undefined || ms < AUTO_MIN_MS || ms > AUTO_MAX_MS) {
 			return { message: "herdr-wake: interval must be 1m-24h, e.g. 90s, 10m or 2h (or `off`)", level: "warning" };
 		}
+		const changed = autoMs !== ms;
 		autoMs = ms;
 		autoGen++;
-		autoSeen = undefined; // the first tick reviews whatever is open
+		autoReviewed.clear(); // the first tick reviews whatever is open
 		scheduleAuto();
+		if (changed) persistState();
 		updateStatus();
 		return {
 			message: `herdr-wake: auto-check every ${formatDuration(ms)}; a tick that lands while this session is busy is skipped`,
@@ -985,9 +1382,79 @@ export default function herdrWake(pi: ExtensionAPI) {
 		};
 	}
 
-	/** The review prompt asks for `ask` only when no pane is still working and nothing is queued. */
+	/** The review prompt asks for `ask` only when no watched pane is still working and nothing is queued. */
 	function reviewBusy(snap: HerdrSnapshot): boolean {
-		return snap.queued > 0 || snap.panes.some(p => p.status === "working");
+		return snap.queued > 0 || snap.panes.some(p => p.status === "working" && watchedSet.has(p.pane));
+	}
+
+	function mutePaneId(paneId: string): void {
+		explicit.delete(paneId);
+		explicitMode.delete(paneId);
+		pending.delete(paneId);
+		blockedPanes.delete(paneId);
+		autoReviewed.delete(paneId);
+		muted.add(paneId);
+		if (watchedSet.has(paneId)) {
+			const next = new Set(watchedSet);
+			next.delete(paneId);
+			watchedSet = next;
+		}
+		persistState();
+		showBlocked();
+		updateStatus();
+		scheduleRefresh();
+	}
+
+	/** `/herdr mute <pane>` and `/herdr unmute <pane>`. */
+	async function setMutedCommand(target: string, mute: boolean, ctx: ExtensionContext): Promise<void> {
+		try {
+			const matches = await resolveTarget(target);
+			if (matches.length === 0) {
+				if (!mute && muted.delete(target)) {
+					persistState();
+					updateStatus();
+					scheduleRefresh();
+					ctx.ui.notify(`herdr-wake: unmuted ${target}`, "info");
+					return;
+				}
+				ctx.ui.notify(`herdr-wake: no live agent pane matches ${target}.`, "warning");
+				return;
+			}
+			if (matches.length > 1) {
+				ctx.ui.notify(
+					`herdr-wake: ${target} is ambiguous (${matches.map(m => m.pane_id).join(", ")}); use a pane id.`,
+					"warning",
+				);
+				return;
+			}
+			const row = matches[0]!;
+			if (row.pane_id === selfPane) {
+				ctx.ui.notify(`herdr-wake: refusing to ${mute ? "mute" : "unmute"} this session's own pane.`, "warning");
+				return;
+			}
+			const who = `${row.pane_id} (${row.label ?? "agent"})`;
+			if (mute) {
+				mutePaneId(row.pane_id);
+				ctx.ui.notify(`herdr-wake: muted ${who}`, "info");
+				return;
+			}
+			if (!muted.delete(row.pane_id)) {
+				ctx.ui.notify(`herdr-wake: ${who} is not muted`, "info");
+				return;
+			}
+			if (!watchedSet.has(row.pane_id) && row.tokens?.[MANAGER_TOKEN] !== "manager" && inScope(row.workspace_id)) {
+				watchedSet = new Set([...watchedSet, row.pane_id].sort());
+			}
+			persistState();
+			updateStatus();
+			scheduleRefresh();
+			ctx.ui.notify(`herdr-wake: unmuted ${who}`, "info");
+		} catch (e) {
+			ctx.ui.notify(
+				`herdr-wake: could not ${mute ? "mute" : "unmute"} ${target}: ${e instanceof Error ? e.message : String(e)}`,
+				"error",
+			);
+		}
 	}
 
 	/** `/herdr focus [pane]`: jump to a pane (default: the oldest blocked one) so the user can answer it there. */
@@ -1020,10 +1487,37 @@ export default function herdrWake(pi: ExtensionAPI) {
 			{ value: "check", label: "check", description: "Ask the model to review every open agent pane" },
 			{ value: "auto", label: "auto", description: "Review open agent panes on a cadence: auto [10m|off]" },
 			{ value: "focus", label: "focus", description: "Jump to a blocked pane: focus [<pane>]" },
+			{ value: "mute", label: "mute", description: "Stop watching a pane: mute <pane>" },
+			{ value: "unmute", label: "unmute", description: "Resume watching a muted pane: unmute <pane>" },
 		];
 		pi.registerCommand("herdr", {
-			description: "List open herdr agent panes; `check` asks the model to review them, `auto` repeats that on a cadence",
-			getArgumentCompletions: prefix => subcommands.filter(s => s.value.startsWith(prefix.trim().toLowerCase())),
+			description:
+				"List open herdr agent panes; `check` asks the model to review them, `auto` repeats on a cadence, `mute`/`unmute` silences panes",
+			getArgumentCompletions: prefix => {
+				const space = prefix.indexOf(" ");
+				if (space === -1) return subcommands.filter(s => s.value.startsWith(prefix.trim().toLowerCase()));
+				const rawSub = prefix.slice(0, space);
+				const sub = rawSub.toLowerCase();
+				const argPrefix = prefix.slice(space + 1).trim();
+				if (sub === "auto") {
+					const presets = ["off", "2m", "5m", "10m", "30m"].filter(p => p.startsWith(argPrefix.toLowerCase()));
+					return presets.length ? presets.map(p => ({ value: `${rawSub} ${p}`, label: p })) : null;
+				}
+				let candidates: string[] = [];
+				if (sub === "focus") {
+					candidates = [...new Set([...blockedPanes, ...lastKnown.keys()])];
+				} else if (sub === "mute") {
+					candidates = [...lastKnown.keys()].filter(p => !muted.has(p));
+				} else if (sub === "unmute") {
+					candidates = [...muted];
+				} else {
+					return null;
+				}
+				const hits = candidates
+					.filter(p => p.toLowerCase().startsWith(argPrefix.toLowerCase()))
+					.map(p => ({ value: `${rawSub} ${p}`, label: p, description: labels.get(p) }));
+				return hits.length ? hits : null;
+			},
 			handler: async (args, ctx) => {
 				if (!running) {
 					ctx.ui.notify("herdr-wake is not running in this session (start omp inside herdr with --herdr-wake).", "warning");
@@ -1033,8 +1527,18 @@ export default function herdrWake(pi: ExtensionAPI) {
 				const [first = "status", rest, ...extra] = args.trim().split(/\s+/).filter(Boolean);
 				const sub = first.toLowerCase();
 				const arg = sub === "auto" ? rest?.toLowerCase() : rest;
-				if (extra.length > 0 || (sub !== "auto" && sub !== "focus" && arg !== undefined) || !subcommands.some(s => s.value === sub)) {
-					ctx.ui.notify("Usage: /herdr [status|check|auto [<interval>|off]|focus [<pane>]]", "warning");
+				const valid =
+					extra.length === 0 &&
+					((sub === "status" && arg === undefined) ||
+						(sub === "check" && arg === undefined) ||
+						sub === "auto" ||
+						sub === "focus" ||
+						((sub === "mute" || sub === "unmute") && arg !== undefined));
+				if (!valid) {
+					ctx.ui.notify(
+						"Usage: /herdr [status|check|auto [<interval>|off]|focus [<pane>]|mute <pane>|unmute <pane>]",
+						"warning",
+					);
 					return;
 				}
 				if (sub === "auto") {
@@ -1046,14 +1550,30 @@ export default function herdrWake(pi: ExtensionAPI) {
 					await focusPane(arg, ctx);
 					return;
 				}
+				if (sub === "mute" || sub === "unmute") {
+					await setMutedCommand(arg!, sub === "mute", ctx);
+					return;
+				}
 				let snap: HerdrSnapshot;
+				let rows: AgentRow[];
+				let seqBefore: number;
 				try {
-					snap = await snapshot();
+					({ snap, rows, seqBefore } = await readSnapshot());
 				} catch (e) {
 					ctx.ui.notify(`herdr-wake: could not read the agent list: ${e instanceof Error ? e.message : String(e)}`, "error");
 					return;
 				}
 				if (sub === "check") {
+					for (const row of rows) {
+						if (
+							(lastEventSeq.get(row.pane_id) ?? 0) <= seqBefore &&
+							watchedSet.has(row.pane_id) &&
+							!muted.has(row.pane_id) &&
+							row.agent_status !== "working"
+						) {
+							markReviewed(row.pane_id, row.agent_status, row);
+						}
+					}
 					const status = prompt.render(statusTemplate, snap).trim();
 					pi.sendUserMessage(prompt.render(checkTemplate, { snapshot: status, busyElsewhere: reviewBusy(snap) }).trim());
 				} else {
@@ -1111,25 +1631,29 @@ export default function herdrWake(pi: ExtensionAPI) {
 						p =>
 							`${p} (${labels.get(p) ?? "agent"}) -> ${[...(explicit.get(p) ?? DEFAULT_UNTIL)].join("|")}${(explicitMode.get(p) ?? "wake") === "digest" ? " [digest]" : ""}`,
 					);
+					for (const p of [...muted].sort()) {
+						rows.push(`${p} (${labels.get(p) ?? "agent"}) -> muted`);
+					}
 					return text(rows.length ? rows.join("\n") : "No panes watched.");
 				}
 				if (!params.pane) return text(`\`pane\` is required for ${params.action}.`);
 				const matches = await resolveTarget(params.pane);
-				if (matches.length === 0) return text(`No live agent pane matches \`${params.pane}\`.`);
+				if (matches.length === 0) {
+					if (params.action === "watch" && muted.delete(params.pane)) {
+						persistState();
+						updateStatus();
+						scheduleRefresh();
+						return text(`Unmuted ${params.pane}.`);
+					}
+					return text(`No live agent pane matches \`${params.pane}\`.`);
+				}
 				if (matches.length > 1) {
 					return text(`\`${params.pane}\` is ambiguous (${matches.map(m => m.pane_id).join(", ")}); use a pane id.`);
 				}
 				const row = matches[0]!;
 				if (row.pane_id === selfPane) return text("Refusing to watch this session's own pane.");
 				if (params.action === "unwatch") {
-					explicit.delete(row.pane_id);
-					explicitMode.delete(row.pane_id);
-					pending.delete(row.pane_id);
-					blockedPanes.delete(row.pane_id);
-					showBlocked();
-					muted.add(row.pane_id);
-					updateStatus();
-					scheduleRefresh();
+					mutePaneId(row.pane_id);
 					return text(`Muted ${row.pane_id}.`);
 				}
 				const until = params.until?.length ? new Set<string>(params.until) : DEFAULT_UNTIL;
@@ -1138,6 +1662,12 @@ export default function herdrWake(pi: ExtensionAPI) {
 				explicit.set(row.pane_id, until);
 				if (mode === "digest") explicitMode.set(row.pane_id, "digest");
 				else explicitMode.delete(row.pane_id);
+				if (row.label) labels.set(row.pane_id, row.label);
+				if (!watchedSet.has(row.pane_id)) {
+					watchedSet = new Set([...watchedSet, row.pane_id].sort());
+				}
+				persistState();
+				updateStatus();
 				scheduleRefresh();
 				return text(`Watching ${row.pane_id} until ${[...until].join("|")}${mode === "digest" ? " (digest)" : ""}.`);
 			},
@@ -1153,6 +1683,7 @@ export default function herdrWake(pi: ExtensionAPI) {
 			return;
 		}
 		if (running) {
+			restoreState(ctx);
 			scheduleRefresh();
 			return;
 		}
@@ -1160,12 +1691,47 @@ export default function herdrWake(pi: ExtensionAPI) {
 		stopped = false;
 		backoffMs = BACKOFF_BASE_MS;
 		registerWatchTool();
+		restoreState(ctx);
+		if (selfPane) {
+			request("pane.report_metadata", {
+				pane_id: selfPane,
+				source: WAKE_TYPE,
+				tokens: { [MANAGER_TOKEN]: "manager" },
+			}).catch(e => logWarn("could not advertise manager role", { error: String(e) }));
+		}
 		void refresh();
 	});
 
-	pi.on("agent_end", (_event: unknown, ctx: ExtensionContext) => {
+	const onSessionChange = (_event: unknown, ctx: ExtensionContext) => {
 		if (!running || stopped || ctx.agent.kind !== "main") return;
 		ctxRef = ctx;
+		restoreState(ctx);
+		scheduleRefresh();
+	};
+	pi.on("session_switch", onSessionChange);
+	pi.on("session_tree", onSessionChange);
+	pi.on("session_branch", onSessionChange);
+
+	pi.on("input", (event: unknown, ctx: ExtensionContext) => {
+		if (!running || stopped || ctx.agent.kind !== "main") return;
+		if (!isRecord(event) || event.source !== "extension") abortHoldUntil = 0;
+	});
+
+	pi.on("agent_start", (_event: unknown, ctx: ExtensionContext) => {
+		if (!running || stopped || ctx.agent.kind !== "main") return;
+		ctxRef = ctx;
+		abortHoldUntil = 0;
+	});
+
+	pi.on("agent_end", (event: unknown, ctx: ExtensionContext) => {
+		if (!running || stopped || ctx.agent.kind !== "main") return;
+		ctxRef = ctx;
+		if (wasTurnAborted(event)) {
+			abortHoldUntil = Date.now() + ABORT_COOLDOWN_MS;
+			if (pending.size > 0 && !throttled) scheduleFlush(ABORT_COOLDOWN_MS);
+			return;
+		}
+		if (isRecord(event) && (event.willContinue === true || event.awaitingAsyncWork === true)) return;
 		// agent_end fires before the session decrements its in-flight count, so isIdle() can still be
 		// false on this tick: give it a moment, then release whatever waited for the end of the turn.
 		if (pending.size > 0 && !throttled) scheduleFlush(IDLE_SETTLE_MS, true);
@@ -1177,7 +1743,19 @@ export default function herdrWake(pi: ExtensionAPI) {
 		return { systemPrompt: [...event.systemPrompt, WORKTREE_GUIDE] };
 	});
 
-	pi.on("session_shutdown", () => {
-		if (running) stop();
+	pi.on("session_shutdown", async () => {
+		if (!running) return;
+		stop();
+		if (selfPane) {
+			await request(
+				"pane.report_metadata",
+				{
+					pane_id: selfPane,
+					source: WAKE_TYPE,
+					tokens: { [MANAGER_TOKEN]: null },
+				},
+				SHUTDOWN_TIMEOUT_MS,
+			).catch(() => {});
+		}
 	});
 }

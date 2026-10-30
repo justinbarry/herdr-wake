@@ -22,14 +22,15 @@ Inert unless OMP runs inside a herdr pane **and** is started with `--herdr-wake`
 ## Features
 
 - **Event-driven.** Subscribes to herdr's agent-status events over its socket. No polling loop, and no changes to OMP or herdr.
-- **Waits for the manager to be free.** `idle` / `done` updates queue while the session is mid-turn and go out as one batched wake once it is idle. Updates from many workers become one turn, not many.
+- **Waits for the manager (and you) to be free.** `idle` / `done` updates queue while the session is mid-turn, while you have a draft in the composer or an open plan review, or during a 15 s cooldown after `Esc` / cancelling `ask`, then go out as one batched wake once clear. Updates from many workers become one turn, not many.
 - **Flapping is filtered.** A pane that goes back to `working` before its update is delivered is dropped from the queue, and queued entries are re-checked against live `agent.list` before they spend a turn.
 - **`blocked` is urgent.** A blocked pane is injected at the manager's next step boundary instead of waiting for idle, and you are alerted at once, independent of the model: a widget above the editor and a notice name the pane, and `/herdr focus` jumps to it so you can answer in the pane itself.
-- **Digest mode.** Panes watched with `mode: "digest"` queue their idle/done updates for the manager's next turn without starting one.
+- **Digest and mute controls.** Panes watched with `mode: "digest"` queue their idle/done updates for the manager's next turn without starting one; `/herdr mute <pane>` and `/herdr unmute <pane>` (or `herdr_watch`) silence user-driven panes. Watch settings, mutes, and `/herdr auto` persist in the session across `--resume`.
+- **Peer managers stay out.** While armed, the manager tags its pane with a display-only `herdr_wake=manager` metadata token (cleared on shutdown) so multiple armed managers in the same repo group do not wake each other unless explicitly watched.
 - **Rate limited.** At most 20 wakes per 10 minutes, as an agent-to-agent ping-pong guard. Pane updates over the cap are held and released when the window clears rather than discarded. (`/herdr auto` ticks that hit the cap are skipped, since the next tick re-reads live state.)
-- **Status only.** Wake text carries pane ids and state changes, never pane text. Pane output is untrusted, so the model reads it itself with `herdr agent read` (or hands it to a subagent).
-- **Manager guidance.** While armed, a short standing note is added to the system prompt: give independent tasks their own herdr worktree, prefer event-driven follow-up over waiting, and keep the main session clear by delegating large tasks rather than carrying them. Large or independent implementation work goes to a herdr worker in its own worktree. Research, long-running commands and heavy inspection (big transcripts, diff review) go to a background `task` subagent, which runs detached and reports back later. Quick answers, simple follow-ups, short pane reads and status-only wakes stay in the main session. For a blocked pane the manager reads what it is asking and, only when no other watched pane is working or queued, puts the question to you with the `ask` tool (restated in its own words, never answering the dialog itself). `ask` parks the whole session until you answer, so otherwise it notes the block in a line and keeps orchestrating. Muted and out-of-scope panes don't count as busy: the manager gets no updates from them, so parking on `ask` doesn't hold anything up.
-- **Review on demand or on a cadence.** `/herdr`, `/herdr check`, `/herdr auto` and `/herdr focus` (below).
+- **Status + triage metadata only.** Wake text carries pane ids, state changes, observed `working` duration, and whether the pane is currently `focused` in herdr — never untrusted pane text. The model reads transcripts itself with `herdr agent read` (or hands heavy output to a subagent).
+- **Manager guidance.** While armed, a short standing note is added to the system prompt: give independent tasks their own herdr worktree, prefer event-driven follow-up over waiting, unwatch panes you tell it you are driving directly, and keep the main session clear by delegating large tasks rather than carrying them. Large or independent implementation work goes to a herdr worker in its own worktree. Research, long-running commands and heavy inspection (big transcripts, diff review) go to a background `task` subagent, which runs detached and reports back later. Quick answers, simple follow-ups, short pane reads and status-only wakes stay in the main session. For a blocked pane the manager reads what it is asking and, only when no other watched pane is working or queued, puts the question to you with the `ask` tool (restated in its own words, never answering the dialog itself). `ask` parks the whole session until you answer, so otherwise it notes the block in a line and keeps orchestrating. Muted and out-of-scope panes don't count as busy: the manager gets no updates from them, so parking on `ask` doesn't hold anything up.
+- **Review on demand or on a cadence.** `/herdr`, `/herdr check`, `/herdr auto`, `/herdr focus`, `/herdr mute` and `/herdr unmute` (below).
 
 ---
 
@@ -76,7 +77,7 @@ omp --herdr-wake            # add --resume <session> to continue one
 
 The status bar shows `herdr-wake: 3 pane(s)`, plus `2 queued` while updates are held, `(throttled)` at the rate cap, and `auto 10m` when a cadence is on.
 
-By default it watches every other agent pane in the manager's workspace and in the rest of its worktree group (the primary workspace and its linked-worktree workspaces: every workspace on the same repo).
+By default it watches every other non-manager agent pane in the manager's workspace and in the rest of its worktree group (the primary workspace and its linked-worktree workspaces: every workspace on the same repo).
 
 ### `herdr_watch` tool
 
@@ -93,14 +94,15 @@ The model can adjust what it watches.
 
 | Command | Effect |
 |---|---|
-| `/herdr` (or `/herdr status`) | List open agent panes: status, how each is watched, and any held update. No model turn. |
-| `/herdr check` | Submit that snapshot to the model with a review prompt: read each non-working pane, report one line per pane, never answer a blocked pane's dialog. |
-| `/herdr auto [interval]` | Repeat the review on a cadence: `90s`, `10m`, `2h` (bare number = minutes; 1m to 24h; default 10m). |
-| `/herdr auto off` | Stop it. The cadence is per process and is not saved. |
+| `/herdr` (or `/herdr status`) | List open agent panes: status, focus, how each is watched, and any held update. No model turn. |
+| `/herdr check` | Submit that snapshot to the model with a review prompt: read each non-working, non-muted pane, report one line per pane, never answer a blocked pane's dialog. |
+| `/herdr auto [interval]` | Repeat the review on a cadence: `90s`, `10m`, `2h` (bare number = minutes; 1m to 24h; default 10m). Saved in the session across `--resume`. |
+| `/herdr auto off` | Stop the cadence (and save `off` in the session). |
 | `/herdr focus [pane]` | Jump to a pane in herdr (default: the oldest blocked one) so you can answer its dialog there. Takes a pane id or agent name. |
+| `/herdr mute <pane>` | Mute a pane (drops any held update and clears its blocked alert). Takes a pane id or agent name. |
+| `/herdr unmute <pane>` | Resume watching a muted pane. |
 
-An auto-check only runs when the session is idle: a tick that lands while the manager is busy is **dropped**, not delayed. It also stays quiet unless some pane is not `working` (or has a held update) and pane states differ from the last review. Each one spends a slot of the same 20-per-10-minutes wake budget.
-
+An auto-check only runs when the session is idle and you are not actively typing or inside the post-`Esc` cooldown: a tick that lands while busy is **dropped**, not delayed. It tracks per-pane `completion_seq` / `state_change_seq` so transitions already delivered by an event wake, `done → idle` sight flips, pane closures, and `→ working` transitions do not spend a turn, and the prompt names only the panes that changed since the last review. Each review spends a slot of the same 20-per-10-minutes wake budget.
 ### How an update is delivered
 
 | Pane change | Manager idle | Manager mid-turn |
@@ -113,10 +115,10 @@ An auto-check only runs when the session is idle: a tick that lands while the ma
 
 ## Known limits
 
-- Tested against a fake herdr socket with one manager and synthetic workers. Production herdr capacity is unmeasured.
-- Every armed manager watches every other agent pane in its repo group, including other managers, so several armed managers in one repo wake each other. The rate cap bounds this but does not prevent it.
-- A change in the set of panes costs a `workspace.list`, two `agent.list` calls and a resubscribe. The 200 ms debounce does not merge changes spaced wider than that.
-- `blocked` alerts share the 20-per-10-minutes cap, so a long storm of updates can hold one.
+- Tested against a fake herdr socket and smoke-verified against herdr 0.9.5; high-pane-count capacity is unmeasured.
+- Refresh uses `session.snapshot` (falling back to `workspace.list` + `agent.list`); when the watched pane set changes, resubscribing takes one extra reconciliation read. The 200 ms refresh debounce does not merge lifecycle bursts spaced wider than that.
+- If a manager process is `SIGKILL`ed before `session_shutdown` clears its `herdr_wake=manager` token, a worker later started in that exact pane stays skipped until explicitly watched (`herdr_watch`) or the pane closes.
+- `blocked` model turns share the 20-per-10-minutes cap (the editor widget and warning notice still fire immediately).
 - Send failures are logged, not retried.
 
 ---

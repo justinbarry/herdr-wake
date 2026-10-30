@@ -3,7 +3,7 @@ herdr-wake: {{agents}} agent pane(s), {{watched}} watched{{#if queued}}, {{queue
 auto-check: {{auto}}
 {{/if}}
 {{#each panes}}
-- {{pane}} ({{label}}){{#if workspace}} in workspace {{workspace}}{{/if}}: {{status}}, {{watch}}{{#if queued}}, queued {{queued}}{{/if}}
+- {{pane}} ({{label}}){{#if workspace}} in workspace {{workspace}}{{/if}}: {{status}}{{#if focused}} (focused){{/if}}, {{watch}}{{#if queued}}, queued {{queued}}{{/if}}
 {{else}}
 No other agent panes are open.
 {{/each}}

@@ -42,10 +42,13 @@ describe("/herdr and /herdr check", () => {
 
 	it("rejects unknown subcommands and stray arguments", async () => {
 		h = await createHarness();
-		for (const args of ["bogus", "check now", "status now"]) {
+		for (const args of ["bogus", "check now", "status now", "mute", "unmute", "mute a b"]) {
 			await h.command(args);
 			expect(h.notices).toEqual([
-				{ message: "Usage: /herdr [status|check|auto [<interval>|off]|focus [<pane>]]", level: "warning" },
+				{
+					message: "Usage: /herdr [status|check|auto [<interval>|off]|focus [<pane>]|mute <pane>|unmute <pane>]",
+					level: "warning",
+				},
 			]);
 		}
 		expect(h.users).toHaveLength(0);
@@ -175,5 +178,136 @@ describe("/herdr auto", () => {
 		await h.advance(800);
 		expect(h.sent).toHaveLength(20);
 		expect(h.status()).toBe("herdr-wake: 2 pane(s), 1 queued (throttled), auto 1m");
+	});
+
+	it("does not re-review transitions already delivered by an event wake", async () => {
+		h = await createHarness();
+		await h.command("auto 10m");
+		await h.setLive("w1:p2", "done", { event: true });
+		await h.advance(800);
+		expect(h.sent).toHaveLength(1);
+		expect(h.sent[0]!.delivery).toBe("wake");
+
+		await h.advance(TEN_MIN);
+		expect(h.sent).toHaveLength(1); // event wake already covered w1:p2
+	});
+
+	it("ignores done -> idle sight flips, -> working transitions, and pane closures when settled panes are unchanged", async () => {
+		h = await createHarness({ panes: ["w1:p2", "w1:p3", "w1:p4"] });
+		await h.command("auto 10m");
+		await h.setLive("w1:p2", "done");
+		await h.setLive("w1:p3", "idle");
+		await h.advance(TEN_MIN);
+		expect(h.sent).toHaveLength(1);
+		expect(h.sent[0]!.changed).toEqual(["w1:p2", "w1:p3"]);
+
+		// User views w1:p2 in herdr (done -> idle, completion_seq unchanged): no new work completed.
+		await h.setLive("w1:p2", "idle");
+		await h.advance(TEN_MIN);
+		expect(h.sent).toHaveLength(1);
+
+		// w1:p3 starts working again while w1:p2 stays idle: nothing settled to review.
+		await h.setLive("w1:p3", "working");
+		await h.advance(TEN_MIN);
+		expect(h.sent).toHaveLength(1);
+
+		// w1:p4 closes while w1:p2 stays idle: closing a pane is not a reason to re-read w1:p2.
+		await h.removeAgent("w1:p4", { event: true });
+		await h.advance(TEN_MIN);
+		expect(h.sent).toHaveLength(1);
+
+		// Now w1:p3 silently completes: only w1:p3 is flagged as changed, not untouched w1:p2.
+		await h.setLive("w1:p3", "done");
+		await h.advance(TEN_MIN);
+		expect(h.sent).toHaveLength(2);
+		expect(h.sent[1]!.changed).toEqual(["w1:p3"]);
+		expect(h.sent[1]!.content).toContain("Changed since last review: w1:p3.");
+	});
+
+	it("skips muted and out-of-scope panes on scheduled ticks", async () => {
+		h = await createHarness({
+			workspaces: [
+				{ workspace_id: "w1", label: "main", worktree: { repo_key: "repo-a" } },
+				{ workspace_id: "w9", label: "other", worktree: { repo_key: "repo-b" } },
+			],
+			agents: [
+				{ pane_id: "w1:p2", workspace_id: "w1", agent_status: "idle", agent: "worker-p2" },
+				{ pane_id: "w9:p1", workspace_id: "w9", agent_status: "idle", agent: "other-agent" },
+			],
+		});
+		await h.command("mute w1:p2");
+		await h.advance(250);
+		await h.command("auto 10m");
+		await h.advance(TEN_MIN);
+		expect(h.sent).toHaveLength(0);
+	});
+
+	it("preserves a newer wake that lands while readSnapshot is in flight", async () => {
+		h = await createHarness({ panes: ["w1:p2", "w1:p3"] });
+		await h.command("auto 10m");
+		await h.setLive("w1:p2", "idle");
+		await h.setLive("w1:p3", "idle");
+		h.holdList();
+		await h.advance(TEN_MIN); // autoCheck's agent.list is now in flight with both panes idle
+
+		// While that stale list is in flight, w1:p2 starts a new cycle and finishes as `done`.
+		await h.setLive("w1:p2", "working", { event: true });
+		await h.setLive("w1:p2", "done", { event: true });
+		await h.releaseList();
+
+		expect(h.sent).toHaveLength(1);
+		expect(h.sent[0]!.delivery).toBe("check");
+		expect(h.sent[0]!.changed).toEqual(["w1:p3"]); // stale w1:p2 row was skipped; its newer wake stays queued
+		expect(h.status()).toBe("herdr-wake: 2 pane(s), 1 queued, auto 10m");
+
+		await h.advance(800);
+		expect(h.sent).toHaveLength(2);
+		expect(h.sent[1]).toMatchObject({ delivery: "wake", panes: [{ pane: "w1:p2", from: "working", to: "done" }] });
+	});
+});
+
+describe("/herdr mute and /herdr unmute", () => {
+	it("mutes a pane (dropping queued wakes and clearing blocked alerts), completes pane ids, and unmutes it", async () => {
+		h = await createHarness();
+		h.setIdle(false);
+		await h.setLive("w1:p2", "blocked", { event: true });
+		expect(h.widget()).toBeDefined();
+
+		expect(h.complete("mute ")?.map(c => c.label)).toEqual(["w1:p2", "w1:p3"]);
+		await h.command("mute w1:p2");
+		expect(h.notices[0]).toEqual({ message: "herdr-wake: muted w1:p2 (worker-p2)", level: "info" });
+		expect(h.widget()).toBeUndefined();
+		// Status and `herdr_watch` list reflect the mute immediately without waiting on the 200ms refresh debounce.
+		expect(h.status()).toBe("herdr-wake: 1 pane(s)");
+		expect(await h.tool({ action: "list" })).toBe("w1:p3 (worker-p3) -> idle|done|blocked\nw1:p2 (worker-p2) -> muted");
+		expect(h.complete("unmute ")?.map(c => c.label)).toEqual(["w1:p2"]);
+		await h.advance(250);
+
+		h.setIdle(true);
+		await h.setLive("w1:p2", "idle", { event: true });
+		await h.advance(1_000);
+		expect(h.sent).toHaveLength(0);
+
+		await h.command("unmute worker-p2");
+		expect(h.notices[0]).toEqual({ message: "herdr-wake: unmuted w1:p2 (worker-p2)", level: "info" });
+		expect(h.status()).toBe("herdr-wake: 2 pane(s)");
+		await h.advance(250);
+	});
+
+	it("refuses to mute the manager's own pane and can unmute a closed pane id", async () => {
+		h = await createHarness({
+			agents: [
+				{ pane_id: "w1:p1", workspace_id: "w1", agent_status: "working", agent: "omp" },
+				{ pane_id: "w1:p2", workspace_id: "w1", agent_status: "working", agent: "worker-p2" },
+			],
+		});
+		await h.command("mute w1:p1");
+		expect(h.notices[0]!.level).toBe("warning");
+
+		await h.command("mute w1:p2");
+		await h.removeAgent("w1:p2", { event: true });
+		await h.advance(250);
+		await h.command("unmute w1:p2");
+		expect(h.notices[0]).toEqual({ message: "herdr-wake: unmuted w1:p2", level: "info" });
 	});
 });
