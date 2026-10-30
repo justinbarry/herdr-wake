@@ -89,6 +89,11 @@ export interface Harness {
 	input(text: string, source?: "interactive" | "rpc" | "extension"): Promise<void>;
 	agentStart(): Promise<void>;
 	agentEnd(event?: Record<string, unknown>): Promise<void>;
+	toolResult(
+		toolName: string,
+		input?: Record<string, unknown>,
+		options?: { isError?: boolean; text?: string; agentKind?: "main" | "sub" },
+	): Promise<{ additionalContext?: string } | undefined>;
 	switchSession(entries?: CustomEntry[]): Promise<void>;
 	entries(): CustomEntry[];
 	paneTokens(pane: string): Record<string, string> | undefined;
@@ -426,6 +431,16 @@ export async function createHarness(
 		},
 		async agentEnd(event = {}) {
 			for (const handler of handlers.get("agent_end") ?? []) await handler(event, ctx);
+		},
+		async toolResult(toolName, input = {}, { isError = false, text = "", agentKind = "main" } = {}) {
+			const callCtx = agentKind === "main" ? ctx : { ...ctx, agent: { kind: "sub" } };
+			const content = text ? [{ type: "text", text }] : [];
+			let out: { additionalContext?: string } | undefined;
+			for (const handler of handlers.get("tool_result") ?? []) {
+				const res = await handler({ type: "tool_result", toolCallId: "tc-1", toolName, input, isError, content }, callCtx);
+				if (res) out = res as { additionalContext?: string };
+			}
+			return out;
 		},
 		async switchSession(entries = []) {
 			branchEntries = [...entries];

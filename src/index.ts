@@ -53,6 +53,15 @@ const SHUTDOWN_TIMEOUT_MS = 250;
 const AUTO_DEFAULT_MS = 10 * 60_000; // `/herdr auto` without an interval
 const AUTO_MIN_MS = 60_000; // every tick can cost a model turn
 const AUTO_MAX_MS = 24 * 3_600_000;
+const INLINE_WORK_NUDGE_AT = 3; // inline research/work calls in one manager turn before nudging to spawn a herdr session
+const ORCHESTRATION_TOOLS: Record<string, true> = { herdr_watch: true, ask: true, wait: true, todo: true };
+const HERDR_CMD_RE = /\bherdr\b/;
+const HERDR_DISPATCH_RE = /\bherdr\s+(?:worktree\s+create|agent\s+(?:start|prompt)|pane\s+(?:split|run|send))/;
+const INLINE_DRIFT_NUDGE =
+	"[herdr-wake] You have run multiple inline research/inspection calls in the manager session this turn without dispatching a worker. " +
+	"Unless the user explicitly asked you to run this inline here, stop pre-investigating in the manager: spin up a herdr worktree session now " +
+	"(`herdr worktree create --branch <name> --no-focus`, `herdr agent start`, `herdr agent prompt` without `--wait`) with a thin brief from what " +
+	"you already know, and let that worker session do the code, DB, log, or PR investigation and fix.";
 
 // Lifecycle events that change which panes/workspaces exist or which are agents. The server
 // also names some of them with an underscore (`pane_created`), so names are normalized below.
@@ -414,6 +423,9 @@ export default function herdrWake(pi: ExtensionAPI) {
 	const autoReviewed = new Map<string, ReviewedPane>(); // per-pane reviewed state so unchanged/event-delivered panes do not re-trigger auto
 	let wakeTimes: number[] = [];
 	let capNotified = false;
+	let inlineCalls = 0;
+	let delegatedThisTurn = false;
+	let nudgedThisTurn = false;
 
 	let refreshing = false;
 	let dirty = false;
@@ -1197,6 +1209,9 @@ export default function herdrWake(pi: ExtensionAPI) {
 		throttled = false;
 		flushing = false;
 		flushAgain = false;
+		inlineCalls = 0;
+		delegatedThisTurn = false;
+		nudgedThisTurn = false;
 		clearTimer(autoTimer);
 		autoTimer = undefined;
 		autoDueAt = 0;
@@ -1721,6 +1736,59 @@ export default function herdrWake(pi: ExtensionAPI) {
 		if (!running || stopped || ctx.agent.kind !== "main") return;
 		ctxRef = ctx;
 		abortHoldUntil = 0;
+		inlineCalls = 0;
+		delegatedThisTurn = false;
+		nudgedThisTurn = false;
+	});
+
+	pi.on("tool_result", (event: unknown, ctx: ExtensionContext) => {
+		try {
+			if (!running || stopped || ctx.agent.kind !== "main" || !isRecord(event)) return undefined;
+			const toolName = str(event.toolName);
+			if (!toolName || ORCHESTRATION_TOOLS[toolName]) return undefined;
+			const failed = event.isError === true;
+			if (toolName === "task") {
+				if (!failed) {
+					delegatedThisTurn = true;
+					inlineCalls = 0;
+				}
+				return undefined;
+			}
+			const input = isRecord(event.input) ? event.input : undefined;
+			if (toolName === "write") {
+				const p = str(input?.path) ?? "";
+				if (
+					p.startsWith("out://") ||
+					p.startsWith("proc://") ||
+					p.startsWith("agent://") ||
+					p.startsWith("local://") ||
+					p.startsWith("/tmp/")
+				) {
+					return undefined;
+				}
+			} else if (toolName === "bash") {
+				const cmd = str(input?.command) ?? "";
+				if (HERDR_DISPATCH_RE.test(cmd)) {
+					const hasJsonError =
+						Array.isArray(event.content) &&
+						event.content.some(c => isRecord(c) && typeof c.text === "string" && c.text.includes('"error":'));
+					if (!failed && !hasJsonError) {
+						delegatedThisTurn = true;
+						inlineCalls = 0;
+					}
+					return undefined;
+				}
+				if (HERDR_CMD_RE.test(cmd)) return undefined;
+			}
+			inlineCalls++;
+			if (!delegatedThisTurn && !nudgedThisTurn && inlineCalls >= INLINE_WORK_NUDGE_AT) {
+				nudgedThisTurn = true;
+				return { additionalContext: INLINE_DRIFT_NUDGE };
+			}
+		} catch {
+			// never fail a tool result from a nudge check
+		}
+		return undefined;
 	});
 
 	pi.on("agent_end", (event: unknown, ctx: ExtensionContext) => {

@@ -132,3 +132,52 @@ describe("snapshot bootstrap, worktree lifecycle, and peer managers", () => {
 		expect(h.sent[0]!.content).toContain("w2:p1 (wt-worker) in workspace feature-wt: working -> done");
 	});
 });
+
+describe("manager research delegation guardrail", () => {
+	it("nudges once on the 3rd inline research call, ignores orchestration/subagents, and only disarms when delegation succeeds", async () => {
+		h = await createHarness();
+		await h.agentStart();
+
+		// Orchestration calls (herdr CLI, /tmp brief staging, subagent calls) never count as inline drift.
+		expect(await h.toolResult("bash", { command: "herdr agent read w1:p2 --lines 80" })).toBeUndefined();
+		expect(await h.toolResult("write", { path: "/tmp/brief.txt", content: "investigate" })).toBeUndefined();
+		expect(await h.toolResult("grep", { pattern: "swaarm" }, { agentKind: "sub" })).toBeUndefined();
+		expect(await h.toolResult("read", { path: "src/index.ts" }, { agentKind: "sub" })).toBeUndefined();
+		expect(await h.toolResult("bash", { command: "git log -n 5" }, { agentKind: "sub" })).toBeUndefined();
+
+		// Failed `herdr worktree create` or failed `task` must NOT suppress the nudge when the manager then falls back to inline research.
+		expect(
+			await h.toolResult("bash", { command: "herdr worktree create --branch dup --no-focus" }, { isError: true }),
+		).toBeUndefined();
+		expect(
+			await h.toolResult(
+				"bash",
+				{ command: "herdr worktree create --branch dup --no-focus 2>&1 | head -5" },
+				{ text: '{"id":"cli","error":{"code":"branch_exists","message":"exists"}}' },
+			),
+		).toBeUndefined();
+		expect(await h.toolResult("task", { tasks: [] }, { isError: true })).toBeUndefined();
+
+		// Inline research in the main session: calls 1 and 2 pass silently, call 3 attaches a non-blocking nudge.
+		expect(await h.toolResult("write", { path: "xd://mcp__linear_get_issue", content: "{}" })).toBeUndefined();
+		expect(await h.toolResult("bash", { command: "gh pr list --state open" })).toBeUndefined();
+		const third = await h.toolResult("write", { path: "xd://mcp__planetscale_execute_read_query", content: "{}" });
+		expect(third?.additionalContext).toContain("herdr worktree create");
+
+		// One-shot per turn: call 4 is not spammed again, and a successful dispatch on the next turn suppresses it.
+		expect(await h.toolResult("read", { path: "README.md" })).toBeUndefined();
+
+		await h.agentStart();
+		expect(await h.toolResult("grep", { pattern: "foo" })).toBeUndefined();
+		expect(
+			await h.toolResult(
+				"bash",
+				{ command: "herdr worktree create --branch investigate-foo --no-focus" },
+				{ text: '{"id":"cli","result":{"workspace_id":"w2"}}' },
+			),
+		).toBeUndefined();
+		expect(await h.toolResult("read", { path: "a.ts" })).toBeUndefined();
+		expect(await h.toolResult("read", { path: "b.ts" })).toBeUndefined();
+		expect(await h.toolResult("read", { path: "c.ts" })).toBeUndefined(); // successful dispatch -> no nudge
+	});
+});
